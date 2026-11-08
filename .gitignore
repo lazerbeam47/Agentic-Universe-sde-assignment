@@ -1,4 +1,6 @@
 runs/
 __pycache__/
 *.pyc
+.pytest_cache/
+controller.sqlite3*
 .venv/
