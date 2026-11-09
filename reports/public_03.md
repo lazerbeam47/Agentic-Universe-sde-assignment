@@ -4,7 +4,7 @@ The earlier scenario server completed its seven-day historical bootstrap in **65
 
 The controller process used a measured maximum resident set of **556,138,496 bytes** and exited after **4.64 seconds** (including failed history ingestion). These figures describe the failed bootstrap attempt only; they are **not** ingest throughput, decision lag, or a completed load benchmark. The generated run directory was removed after the failure, restoring approximately 2.4 GiB. After the compact-storage changes, a new public_03 run was attempted, but automatic approval review rejected launching another multi-gigabyte simulator run while the shared volume had only about 2.7 GiB available. No second public_03 benchmark result is claimed.
 
-Compact chunk storage was measured on public_02: 324,308 events, 142,011,267 raw bytes, 5,977,368 compressed chunk bytes, and a 10,412,032-byte SQLite database (about 32.1 MB per million events, including normalized indexes and audit). That smaller run does not establish public_03 peak memory, bootstrap throughput, or full-run disk use. A public_03 run remains outstanding and requires a reviewed environment with safe disk headroom.
+Compact chunk storage was measured on the final public_02 run: 324,311 events, 141,964,609 raw bytes, 5,991,550 compressed chunk bytes, and a 10,452,992-byte SQLite database (about 32.2 MB per million events, including normalized indexes and audit; 4,461,442 bytes were indexed-table and index overhead). The largest source chunk was 81,936,109 raw bytes. That smaller run does not establish public_03 peak memory, bootstrap throughput, or full-run disk use. A public_03 run remains outstanding and requires a reviewed environment with safe disk headroom.
 
 ## Controlled synthetic storage measurement
 

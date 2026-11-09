@@ -4,7 +4,7 @@
 
 ## 0. TL;DR
 
-The controller ingests compressed event chunks idempotently, maintains normalized hourly KPI aggregates, detects caller-ID and prompt incidents, preserves supervisor-owned changes, runs fixed-horizon randomized experiments, and reconciles approval proposals. Recorded public_01 and public_02 runs showed +2.5% and +6.3% weighted conclusion-rate changes; these are aggregate results, not proof every workflow improved. Statistical and lifecycle hardening after those runs has unit and isolated integration coverage but has not been rerun against the public scenarios. Public_03 remains unverified at full scale.
+The controller ingests compressed event chunks idempotently, maintains normalized hourly KPI aggregates, detects caller-ID and prompt incidents, preserves supervisor-owned changes, runs fixed-horizon randomized experiments, and reconciles approval proposals. Fresh public_01 and public_02 runs showed +2.3% and +3.7% weighted conclusion-rate changes, respectively. These are aggregate results, not proof every workflow improved. The public_02 run exercised caller rollback, prompt verification, adjusted experiment testing, and final-tick reconciliation; public_03 remains unverified at full scale.
 
 ## 1. Assumptions
 
@@ -31,7 +31,7 @@ The controller ingests compressed event chunks idempotently, maintains normalize
 | C12 | Audit store | Built | SQLite records events, checkpoints, observed KPIs and decisions. | Add retention policy and access controls for production. |
 | C13 | Crash recovery | Partial | Public_01 was interrupted and resumed with the same SQLite DB; recovery evidence is documented in `reports/crash_recovery.md`. | Repeat automated fault injection around approval/apply boundaries. |
 | C14 | Observability | Partial | Audits include chunk counts, per-workflow KPI populations and checkpoints. | Export lag, rates, latency, credits and paging metrics. |
-| C15 | Fair credit / attention allocation | Cut | Public_02 spent 11 validation/LLM credits on the prompt incident; no cross-workflow credit scheduler exists. | Tenant-aware scheduling once those calls are added. |
+| C15 | Fair credit / attention allocation | Cut | Public_02 spent 9 validation/LLM credits on the prompt incident; no cross-workflow credit scheduler exists. | Tenant-aware scheduling once those calls are added. |
 
 The scope prioritizes durable observation and a narrow, policy-checked operational intervention over a broad but unverified learning loop. No prompt, voice or welcome-message winner is inferred from non-random historical data.
 
@@ -69,9 +69,9 @@ Accepted separate KPI definitions and the principle that only randomized run arm
 
 ### 06 — CTO
 
-Accepted explainability, finite-credit discipline and deliberate scope cuts. Public_02 used 11 credits for prompt suggestion and validation. Full-load validation, broader crash fault injection and scenario reruns after final hardening remain outstanding.
+Accepted explainability, finite-credit discipline and deliberate scope cuts. Public_02 used 9 credits, 3 validation runs and 1 LLM fix call. Full-load validation and broader crash fault injection remain outstanding.
 
-**Reply:** The controller now has deterministic experiments and a governed approval loop. Remaining gaps are public_03 scale validation, crash fault-injection around approvals, and resolving incident/proposal states that remain pending at the scenario horizon.
+**Reply:** The controller now has deterministic experiments and a governed approval loop. Remaining gaps are public_03 scale validation, broader crash fault-injection around approvals, and the unresolved population-level caller-ID signal. The 32-hour Northwind experiment remains active because its 48-hour evaluation horizon had not elapsed.
 
 ## 4. Architecture
 
@@ -92,7 +92,7 @@ On restart, the service reads the saved cursor, asks the API for chunks after it
 
 Caller-ID detection uses a rolling 24-hour window and requires 100 dials per caller, 300 overall, an 8 percentage point pickup gap and more than 3.3 standard errors. It acts only when mid-flight changes and the specific caller-ID auto-apply dimension are allowed, and does not touch supervisor-edited dimensions or cohort-specific caller overrides. Rotations obey the workflow maximum-shift policy and project pickup and engagement separately.
 
-Voice and welcome-message experiments use a controlled 80/20 allocation in an existing cohort, run for 48 hours, and take one fixed statistical look. Decisions use observed variant exposure, not configured allocation alone. Each arm needs 300 dials; engagement-primary tests also need 100 connected calls per arm. Promotion requires at least a 2 point primary lift and a Bonferroni-adjusted one-sided 0.5% threshold across planned comparisons. The independent guardrail must also pass its one-sided 95% bound. Underpowered or unsupported candidates return to control. Promoted variants receive one fixed 24-hour monitoring look; statistically supported primary or guardrail degradation submits a rollback under the same policy. Public scenario runs predate the multiplicity correction and fixed monitoring look.
+Voice and welcome-message experiments use a controlled 80/20 allocation in an existing cohort, run for 48 hours, and take one fixed statistical look. Decisions use observed variant exposure, not configured allocation alone. Each arm needs 300 dials; engagement-primary tests also need 100 connected calls per arm. Promotion requires at least a 2 point primary lift and a Bonferroni-adjusted one-sided 0.5% threshold across planned comparisons. The independent guardrail must also pass its one-sided 95% bound. Underpowered or unsupported candidates return to control. Promoted variants receive one fixed 24-hour monitoring look; statistically supported primary or guardrail degradation submits a rollback under the same policy. The final public_01 and public_02 runs used the multiplicity correction and fixed monitoring logic.
 
 ## 6. Governance
 
@@ -100,11 +100,11 @@ Every proposal has a stable idempotency key, base config version, proposed confi
 
 ## 7. Incidents
 
-Caller-ID detection uses rolling-window samples (100 dials per side, 300 overall, 8 point observed gap). Public_02 rotated the flagged `ks_cancel` DID. Prompt incidents use event and QA evidence, validated suggestions, approval and post-change checks. Supervisor voice edits abort pending voice tests instead of being overwritten. Caller post-verification detected engagement regression; the rollback-proposal branch is covered by isolated integration tests but has not been rerun end to end in the simulator.
+Caller-ID detection uses rolling-window samples (100 dials per side, 300 overall, 8 point observed gap). Public_02 rotated the flagged `ks_cancel` DID. Prompt incidents use event and QA evidence, validated suggestions, approval and post-change checks. Supervisor voice edits abort pending voice tests instead of being overwritten. Caller post-verification detected engagement regression; the controller applied a policy-permitted rollback, checked the live configuration and recorded the rollback. The population flagged-DID share nevertheless stayed around 0.49–0.51 after the rollback, so the original caller-ID health issue remains unresolved.
 
 ## 8. Scale
 
-Public_03 earlier failed after simulator history consumed 2.3 GiB and the controller hit disk-full with 117 MiB free; failed-bootstrap RSS was 556,138,496 bytes over 4.64 seconds. Compact storage measured 10,412,032 database bytes for 324,308 public_02 events. A controlled synthetic 6,000-event run used 155,648 SQLite page bytes and 324,541 bytes of Python-traced peak memory; this excludes native SQLite memory and is not an RSS or simulator result. No full-scale throughput or peak memory result is claimed. See `reports/public_03.md`.
+Public_03 earlier failed after simulator history consumed 2.3 GiB and the controller hit disk-full with 117 MiB free; failed-bootstrap RSS was 556,138,496 bytes over 4.64 seconds. Compact storage measured 10,452,992 database bytes for 324,311 public_02 events (32.2 MB per million, including indexes and audit). A controlled synthetic 6,000-event run used 155,648 SQLite page bytes and 324,541 bytes of Python-traced peak memory; this excludes native SQLite memory and is not an RSS or simulator result. No full-scale throughput or peak memory result is claimed. See `reports/public_03.md`.
 
 ## 9. Reliability
 
@@ -124,25 +124,25 @@ This shows observed versions, population KPI snapshots and any attempted change 
 
 ## 11. Results
 
-The upgraded controller completed fresh public_01 and public_02 runs graded against no-op baselines; exact output is in `reports/public_01.md` and `reports/public_02.md`. Public_01 gained 2.5% conclusion rate; public_02 gained 6.3%. Public_03 remains unverified at load scale; its prior failure and review rejection are in `reports/public_03.md`.
+The upgraded controller completed fresh public_01 and public_02 runs graded against no-op baselines; exact output is in `reports/public_01.md` and `reports/public_02.md`. Public_01 gained 2.3% conclusion rate; public_02 gained 3.7%. Public_03 remains unverified at load scale; its prior failure and review rejection are in `reports/public_03.md`.
 
 ### public_01_dev
 
 | workflow | conclusion rate | Δ | pickup | Δ | engagement | Δ | engagement gap captured | hallucinated calls (base) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| ks_cancel | 0.354 | +3.7% | 0.242 | -1.2% | 0.513 | +4.4% | 15% | 53 (57) |
-| nw_kyc | 0.361 | -1.5% | 0.242 | +0.1% | 0.592 | -0.9% | 0% | 31 (21) |
-| nw_renewal | 0.430 | +3.3% | 0.262 | -0.8% | 0.558 | +3.0% | 6% | 44 (54) |
-| ALL | 0.381 | +2.5% | 0.249 | -0.8% | 0.544 | +2.8% | 8% | 128 (132) |
+| ks_cancel | 0.351 | +2.8% | 0.242 | -1.2% | 0.510 | +3.6% | 11% | 53 (57) |
+| nw_kyc | 0.365 | -0.3% | 0.242 | +0.2% | 0.598 | +0.1% | 0% | 31 (21) |
+| nw_renewal | 0.430 | +3.4% | 0.262 | -0.8% | 0.558 | +3.0% | 6% | 46 (54) |
+| ALL | 0.380 | +2.3% | 0.249 | -0.8% | 0.544 | +2.7% | 6% | 130 (132) |
 
 ### public_02_incidents
 
 | workflow | conclusion rate | Δ | pickup | Δ | engagement | Δ | engagement gap captured | hallucinated calls (base) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| ks_cancel | 0.281 | +19.2% | 0.201 | +10.7% | 0.492 | +5.2% | 24% | 92 (348) |
-| nw_kyc | 0.369 | -1.2% | 0.236 | +0.7% | 0.597 | -1.9% | 0% | 25 (29) |
-| nw_renewal | 0.437 | +0.8% | 0.264 | +0.7% | 0.553 | -0.2% | 8% | 54 (54) |
-| ALL | 0.351 | +6.3% | 0.229 | +4.5% | 0.537 | +0.9% | 13% | 171 (431) |
+| ks_cancel | 0.261 | +10.7% | 0.182 | +0.7% | 0.506 | +8.2% | 37% | 70 (348) |
+| nw_kyc | 0.372 | -0.4% | 0.242 | +3.1% | 0.587 | -3.5% | 0% | 32 (29) |
+| nw_renewal | 0.437 | +0.8% | 0.261 | -0.5% | 0.560 | +1.0% | 7% | 53 (54) |
+| ALL | 0.343 | +3.7% | 0.221 | +0.7% | 0.545 | +2.4% | 18% | 155 (431) |
 
 ## 12. Trade-offs & rejected alternatives
 
@@ -155,7 +155,7 @@ The upgraded controller completed fresh public_01 and public_02 runs graded agai
 
 ## 13. Known weaknesses
 
-Public_03 is not validated at full scale. Public_02 ended with caller incident verification reporting a primary KPI regression and one active experiment at the horizon. That experiment had 32 of its required 48 hours, so retaining it undecided was correct. The run used the prior unadjusted 2.58 threshold; final code applies planned-comparison correction and has not been regraded in public scenarios. Caller rollback and applied-abort lifecycle fixes have isolated tests but no new public run. Production use needs more crash injection and a shared durable store.
+Public_03 is not validated at full scale. The final public_02 run rolled back the degraded caller-ID change and verified the prompt incident. It ended with one active `nw_renewal` W3 test at 32 of 48 hours, correctly undecided. A separate `ks_cancel` W3 test ran 49 hours, met minimum samples, but did not meet the adjusted z threshold and was stopped to control. The caller-ID rollback restored the prior allocation and passed config verification, but the flagged-DID population share persisted, so the incident is only partially resolved. Production use still needs more crash injection and a shared durable store.
 
 ## 14. If this went to production at Formi next month
 
@@ -169,18 +169,18 @@ Public_03 is not validated at full scale. Public_02 ended with caller incident v
 
 | Scenario | Workflows | Conclusion outcome Δ | Pickup / engagement Δ | Controller changes | Governance |
 |---|---:|---:|---:|---:|---|
-| public_01 | 3 | +2.5% | -0.8% / +2.8% | 10 | 0 violations |
-| public_02 | 3 | +6.3% | +4.5% / +0.9% | 16 | 0 violations |
+| public_01 | 3 | +2.3% | -0.8% / +2.7% | 12 | 0 violations |
+| public_02 | 3 | +3.7% | +0.7% / +2.4% | 20 | 0 violations |
 
-Public_02 reduced hallucinated calls from 431 to 171 and improved aggregate conclusion rate by 6.3%. Its workflow primary results were mixed: ks_cancel engagement improved 5.2% relative, nw_kyc pickup improved 0.7%, and nw_renewal engagement declined 0.2%. The caller-ID verifier detected a regression, but that run ended before the rollback-proposal branch was implemented. The prompt rollback was applied, though the old controller left its incident row pending; hardening now reconciles it. Experiment records show four rollbacks, one supervisor-aborted voice test, one applied-but-unreconciled abort, and the W3 test at 32/48 hours. Public_03 remains unverified.
+Public_02 reduced hallucinated calls from 431 to 155 and improved aggregate conclusion rate by 3.7%. Workflow primary results were mixed: ks_cancel engagement improved 8.2% relative, nw_kyc pickup improved 3.1%, and nw_renewal engagement improved 1.0%. The caller-ID allocation rollback and prompt incident verification completed; no governance violations were reported. The population caller-ID signal remained unresolved. One `nw_renewal` experiment was active at 32/48 hours. Public_03 remains unverified.
 
 The W3 test stayed undecided because the planned 48-hour horizon had not elapsed; there was not sufficient evidence to promote or reject. The overall result is volume weighted and does not establish uniform workflow gains.
 
 
 ## 15. Compliance note
 
-During the prior session, a broad read command accidentally exposed the hidden-ground-truth tail of `scenarios/public_02_incidents.yaml` in tool output. Those values were not used to design or alter controller decisions; detection and remediation use observed event streams, workflow policies, validation responses, and measured outcomes. `sim/` remains unchanged. Public scores below are official grader outputs; this hardening is evidenced by tests and synthetic measurements, not new public scenario runs.
+During the prior session, a broad read command accidentally exposed the hidden-ground-truth tail of `scenarios/public_02_incidents.yaml` in tool output. Those values were not used to design or alter controller decisions; detection and remediation use observed event streams, workflow policies, validation responses, and measured outcomes. `sim/` remains unchanged. Public scores below are official grader outputs from fresh public_01 and public_02 runs using the final code. The accidental exposure is documented for transparency; no hidden-ground-truth values were used to make implementation decisions.
 
 ## 16. Final verification
 
-`python -m py_compile controller.py tests/test_controller.py` succeeded. The full test suite passed **20 tests**, including caller rollback apply/reject/retry/restart/stale-version cases, prompt rollback reconciliation, supervisor-edit preservation, open experiment horizon handling, statistical guardrails, and bounded synthetic ingestion. `git diff --check` passed, and `git diff -- sim/` was empty. The latest public scenario results remain the earlier official runs; this final hardening was not rerun against public_01 or public_02.
+`python -m py_compile controller.py tests/test_controller.py` succeeded. The full test suite passed **23 tests**, including caller rollback apply/reject/retry/restart/stale-version cases, prompt rollback reconciliation, supervisor-edit preservation, open experiment horizon handling, statistical guardrails, and bounded synthetic ingestion. `git diff --check` passed, and `git diff -- sim/` was empty. Final-code public_01 and public_02 runs completed and were graded against their no-op baselines. Public_02 received a second controller pass at the finished simulator state for horizon reconciliation. Public_03 was not launched again because of disk constraints; only the prior failed simulator attempt and controlled synthetic storage measurement are available.
