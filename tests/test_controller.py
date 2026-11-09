@@ -57,7 +57,8 @@ def test_experiment_checks_primary_and_guardrail_independently(tmp_path):
         assert not guard_sample["minimum_sample"]
         corrected=controller._compare_experiment(wf,(400,200,180),(400,200,140),multiplicity=5)
         assert corrected["primary_threshold"]>2.58
-        monitor,regressed=controller._promotion_monitor(wf,{"candidate":(1000,500,300)},(400,120,108),"t0","t1")
+        baseline=controller._compare_experiment(wf,(400,200,120),(400,200,120))
+        monitor,regressed=controller._promotion_monitor(wf,baseline,(400,120,108),"t0","t1")
         assert monitor["primary_regression"] is False
         assert monitor["guardrail_regression"] is True
         assert regressed
@@ -77,6 +78,23 @@ def test_experiment_at_scenario_horizon_stays_undecided_and_audits_exposure(tmp_
         assert entry["reason"]=="fixed_48h_horizon_not_elapsed"
         assert entry["elapsed_hours"]==32
         assert entry["candidate_exposure"][0]==1032
+
+
+def test_horizon_reconciles_stop_applied_on_final_tick(tmp_path,monkeypatch):
+    with Store(str(tmp_path/"final_tick.sqlite3")) as store:
+        config={"allocations":{"default":{"welcome_message":{"W1":1.0}}}}
+        with store.db:
+            store.db.execute("INSERT INTO experiments VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("exp","wf","welcome_message","default","W1","W2",0.2,2,"rollback_pending",
+                 "2027-01-01T00:00:00+05:30","2027-01-03T01:00:00+05:30",json.dumps({"proposal_id":"stop"})))
+            store.db.execute("INSERT INTO proposals VALUES(?,?,?,?,?,?,?,?,?,?)",
+                ("stop","wf",None,"applied",3,"auto:experiment_stop","exp",
+                 json.dumps({"proposed_config":config}),"t0","t1"))
+        ctl=Controller("http://unused",store)
+        monkeypatch.setattr(ctl,"get_json",lambda *_a,**_k:{"config":config})
+        ctl.audit_open_experiments_at_horizon("2027-01-03T01:00:00+05:30")
+        assert store.db.execute("SELECT status,ended_at FROM experiments WHERE experiment_id='exp'").fetchone()==("rolled_back","2027-01-03T01:00:00+05:30")
+        assert store.db.execute("SELECT COUNT(*) FROM audit WHERE action='experiment_open_at_horizon'").fetchone()[0]==0
 
 
 def test_supervisor_voice_edit_aborts_pending_test_without_rewriting_config(tmp_path):
@@ -104,6 +122,27 @@ def test_confounded_experiment_terminalizes_after_abort_proposal_applies(tmp_pat
         monkeypatch.setattr(ctl,"get_json",lambda *_a,**_k:{"version":2,"config":{"allocations":{"default":{"voice":{"V1":1.0}}}}})
         ctl.run_experiments([{"workflow_id":"wf","mid_flight":"locked","options":{}}],"2027-01-04T12:00:00+05:30")
         assert store.db.execute("SELECT status FROM experiments WHERE experiment_id='exp'").fetchone()[0]=="aborted_confounded"
+
+
+def test_experiment_uses_existing_highest_volume_cohort_without_rewriting_cohort_rules(tmp_path,monkeypatch):
+    with Store(str(tmp_path/"cohorts.sqlite3")) as store:
+        ctl=Controller("http://unused",store)
+        config={"cohorts":[{"id":"senior","where":{"age_band":["60+"]}},
+                            {"id":"young","where":{"age_band":["18-30"]}}],
+            "allocations":{"default":{"voice":{"V1":1.0}}}}
+        for cohort,dials in (("senior",900),("young",300)):
+            store.db.execute("INSERT INTO variant_hourly VALUES(?,?,?,?,?,?,?,?,?,?)",
+                ("wf","voice",cohort,"2027-01-04T09:00","V1",dials,300,180,0,0))
+        captured={}
+        def submit(exp,wf,current,distribution,action,ts,reason):
+            captured.update({"cohort":exp["cohort_id"],"distribution":distribution,"config":current["config"]})
+            return "proposal"
+        monkeypatch.setattr(ctl,"_submit_experiment_allocation",submit)
+        wf={"workflow_id":"wf","mid_flight":"allowed","options":{"voice":["V1","V2"]}}
+        ctl._new_experiment(wf,{"version":1,"config":config},"2027-01-04T10:00:00+05:30")
+        assert captured["cohort"]=="senior"
+        assert captured["distribution"]=={"V1":0.8,"V2":0.2}
+        assert captured["config"]["cohorts"]==config["cohorts"]
 
 
 def test_compact_storage_keeps_raw_audit_and_reports_size(tmp_path):
@@ -280,6 +319,29 @@ def test_caller_rollback_obeys_approval_rejection_and_stale_version(tmp_path,mon
     ctl.reconcile_proposals({"wf":wf},"2027-01-04T16:00:00+05:30")
     assert live["config"]["allocations"]["default"]["voice"]=={"V2":1.0}
     assert store.db.execute("SELECT status FROM proposals WHERE proposal_id=?",(pid,)).fetchone()[0]=="stale"
+
+
+def test_approval_expiry_and_apply_window_are_reconciled_without_late_apply(tmp_path,monkeypatch):
+    with Store(str(tmp_path/"approval-window.sqlite3")) as store:
+        body={"proposed_config":{"prompt_version":"P2"},"expires_in_hours":12}
+        with store.db:
+            store.db.execute("INSERT INTO proposals VALUES(?,?,?,?,?,?,?,?,?,?)",
+                ("late","wf","app1","approved",3,"prompt_change","P2",json.dumps(body),"t0","t1"))
+            store.db.execute("INSERT INTO proposals VALUES(?,?,?,?,?,?,?,?,?,?)",
+                ("expired","wf","app2","pending",3,"prompt_change","P3",json.dumps(body),"t0","t1"))
+        ctl=Controller("http://unused",store)
+        def get_json(path,**_kwargs):
+            if path=="/workflows/wf/config": return {"version":3,"config":{"prompt_version":"P1"}}
+            if path=="/approvals/app1": return {"approval_id":"app1","status":"approved","apply_by":"2027-01-04T11:00:00+05:30"}
+            if path=="/approvals/app2": return {"approval_id":"app2","status":"expired"}
+            raise AssertionError(path)
+        def request(*_args,**_kwargs): raise AssertionError("expired apply must not be sent")
+        monkeypatch.setattr(ctl,"get_json",get_json); monkeypatch.setattr(ctl,"request",request)
+        ctl.reconcile_proposals({"wf":{}},"2027-01-04T12:00:00+05:30")
+        assert store.db.execute("SELECT status FROM proposals WHERE proposal_id='late'").fetchone()[0]=="lapsed"
+        assert store.db.execute("SELECT status FROM proposals WHERE proposal_id='expired'").fetchone()[0]=="expired"
+        audit=json.loads(store.db.execute("SELECT details FROM audit WHERE action='proposal_lapsed'").fetchone()[0])
+        assert audit["reconciled_after_apply_window"] is True
 
 
 def test_prompt_rollback_proposal_advances_incident_only_after_config_matches(tmp_path,monkeypatch):

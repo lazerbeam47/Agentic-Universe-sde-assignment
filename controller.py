@@ -471,6 +471,10 @@ class Controller:
                 if state in ("rejected","expired","lapsed"):
                     self._update_proposal(pid,state,ts,aid,approval); continue
                 if state=="approved":
+                    apply_by=approval.get("apply_by")
+                    if apply_by and datetime.fromisoformat(ts)>datetime.fromisoformat(apply_by):
+                        self._update_proposal(pid,"lapsed",ts,aid,{"apply_by":apply_by,"reconciled_after_apply_window":True})
+                        continue
                     if current["version"]!=base:
                         # If the current version is the proposed config, reconcile a lost apply response.
                         if current.get("config")==body.get("proposed_config"):
@@ -517,7 +521,7 @@ class Controller:
 
     def _record_experiment(self,experiment_id,status,ts,decision=None):
         with self.store.db:
-            self.store.db.execute("UPDATE experiments SET status=?,ended_at=CASE WHEN ? IN ('active','promoted') THEN ended_at ELSE ? END,decision=COALESCE(?,decision) WHERE experiment_id=?",
+            self.store.db.execute("UPDATE experiments SET status=?,ended_at=CASE WHEN ? IN ('active','promoted') THEN NULL WHEN ended_at IS NULL THEN ? ELSE ended_at END,decision=COALESCE(?,decision) WHERE experiment_id=?",
                                   (status,status,ts,json.dumps(decision,sort_keys=True) if decision is not None else None,experiment_id))
         row=self.store.db.execute("SELECT workflow_id,dimension,cohort_id,candidate FROM experiments WHERE experiment_id=?",(experiment_id,)).fetchone()
         if row: self.store.audit(ts,row[0],"experiment_"+status,{"experiment_id":experiment_id,"dimension":row[1],"cohort_id":row[2],"candidate":row[3],"decision":decision})
@@ -649,7 +653,7 @@ class Controller:
                     cfg.setdefault("allocations",{}).setdefault(cohort,{})[dim]={control:1.0}
                     exp={"experiment_id":eid,"workflow_id":wid,"dimension":dim,"cohort_id":cohort,"control":control,"candidate":candidate}
                     pid=self.submit_change(wf,current,cfg,"experiment_rollback",eid,
-                        f"Promoted {candidate} has degraded on {primary} by {delta:.3f} against its promotion baseline; restore {control}.",ts,
+                        f"Promoted {candidate} failed its fixed post-promotion check on {primary} (point delta {details['primary_delta']:.3f}; guardrail lower bound {details['guardrail_lower_95']:.3f}); restore {control}.",ts,
                         summary=f"Roll back degraded {dim} {candidate} to {control}.",dry_run=details,impact_score=0.7,
                         affected_leads=int(wf.get("daily_batch",{}).get("size",0)))
                     self._record_experiment(eid,"rollback_pending",ts,{"proposal_id":pid,"verification":details})
@@ -696,7 +700,10 @@ class Controller:
     def _promotion_monitor(self,wf,baseline,post,start,end):
         """Take one fixed 24h post-promotion look; compare primary and guardrail separately."""
         objective=wf.get("objective",{}); primary=objective.get("primary")
-        base=baseline.get("candidate",(0,0,0)); bd,bc,be=base
+        base=baseline.get("candidate")
+        if base is None:
+            base=(baseline.get("candidate_dials",0),baseline.get("candidate_connected",0),baseline.get("candidate_engaged",0))
+        bd,bc,be=base
         pd,pc,pe=post
         def pair(metric,counts):
             d,c,e=counts
@@ -1162,6 +1169,37 @@ class Controller:
             self.store.audit(ts,wid,"caller_id_incident_"+status,{"incident_id":iid,"proposal_id":pid,"proposal_status":pstatus})
 
     def audit_open_experiments_at_horizon(self, ts: str) -> None:
+        # A proposal can be applied on the simulator's final tick, leaving no next
+        # control-loop iteration to consume the durable application result.
+        pending=self.store.db.execute("SELECT experiment_id,workflow_id,status,decision FROM experiments WHERE status IN ('promotion_pending','rollback_pending','abort_pending')").fetchall()
+        for eid,wid,status,raw_decision in pending:
+            decision=json.loads(raw_decision) if raw_decision else {}
+            pid=decision.get("proposal_id")
+            proposal=self.store.db.execute("SELECT status,body,updated_at FROM proposals WHERE proposal_id=?",(pid,)).fetchone() if pid else None
+            if not proposal: continue
+            pstatus,body,updated=proposal
+            if pstatus=="applied":
+                try:
+                    current=self.get_json(f"/workflows/{wid}/config")
+                    expected=json.loads(body).get("proposed_config")
+                except (RuntimeError,httpx.HTTPError,ValueError,KeyError) as exc:
+                    self.store.audit(ts,wid,"experiment_horizon_reconcile_error",{"experiment_id":eid,"proposal_id":pid,"error":str(exc)})
+                    continue
+                if current.get("config")!=expected:
+                    terminal="application_config_mismatch"
+                elif status=="promotion_pending":
+                    comparison=decision.get("comparison",{})
+                    self._record_experiment(eid,"promoted",ts,{"proposal_id":pid,"baseline":comparison,"promoted_at":updated})
+                    continue
+                elif status=="abort_pending":
+                    terminal="aborted_confounded"
+                else:
+                    terminal="rolled_back"
+            elif pstatus in ("rejected","expired","lapsed","stale","denied","deferred_fatigue","apply_error"):
+                terminal="application_failed"
+            else:
+                continue
+            self._record_experiment(eid,terminal,ts,{"proposal_id":pid,"proposal_status":pstatus,"prior_status":status})
         rows=self.store.db.execute("SELECT experiment_id,workflow_id,dimension,cohort_id,control,candidate,status,started_at,decision FROM experiments WHERE status IN ('awaiting_start','active','promotion_pending','rollback_pending','promoted','confounded','abort_pending')").fetchall()
         final=datetime.fromisoformat(ts)
         for eid,wid,dim,cohort,control,candidate,status,started,raw_decision in rows:
