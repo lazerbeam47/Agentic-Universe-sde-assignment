@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import sqlite3
+from statistics import NormalDist
 import time
 import uuid
 import zlib
@@ -578,13 +579,21 @@ class Controller:
     def run_experiments(self,workflows,ts):
         now=datetime.fromisoformat(ts)
         by_id={w.get("workflow_id",w.get("id")):w for w in workflows}
-        rows=self.store.db.execute("SELECT experiment_id,workflow_id,dimension,cohort_id,control,candidate,allocation,base_version,status,started_at,decision FROM experiments WHERE status IN ('awaiting_start','active','promotion_pending','rollback_pending','promoted','confounded') ORDER BY started_at").fetchall()
+        rows=self.store.db.execute("SELECT experiment_id,workflow_id,dimension,cohort_id,control,candidate,allocation,base_version,status,started_at,decision FROM experiments WHERE status IN ('awaiting_start','active','promotion_pending','rollback_pending','promoted','confounded','abort_pending') ORDER BY started_at").fetchall()
         handled=set()
         for row in rows:
             eid,wid,dim,cohort,control,candidate,allocation,base,status,started,decision_raw=row
             handled.add(wid); wf=by_id.get(wid,{})
             decision=json.loads(decision_raw) if decision_raw else {}
             current=self.get_json(f"/workflows/{wid}/config")
+            if status=="abort_pending":
+                pid=decision.get("proposal_id")
+                proposal=self.store.db.execute("SELECT status FROM proposals WHERE proposal_id=?",(pid,)).fetchone()
+                if proposal and proposal[0]=="applied":
+                    self._record_experiment(eid,"aborted_confounded",ts,{"proposal_id":pid,"reason":"supervisor prompt change invalidated experiment"})
+                elif proposal and proposal[0] in ("rejected","expired","lapsed","stale","denied","deferred_fatigue","apply_error"):
+                    self._record_experiment(eid,"abort_failed",ts,{"proposal_id":pid,"proposal_status":proposal[0]})
+                continue
             if status=="awaiting_start":
                 pid=decision.get("proposal_id")
                 proposal=self.store.db.execute("SELECT status,updated_at FROM proposals WHERE proposal_id=?",(pid,)).fetchone()
@@ -623,14 +632,19 @@ class Controller:
                     self._record_experiment(eid,"promotion_failed",ts,{"proposal_status":p[0]})
                 continue
             if status=="promoted":
+                if decision.get("monitoring_result"): continue
                 baseline=decision.get("baseline",{}); promoted_at=decision.get("promoted_at",started)
-                post=self._experiment_counts(wid,dim,cohort,candidate,promoted_at,ts)
-                if post[0]<300 or (wf.get("objective",{}).get("primary")=="engagement_rate" and post[1]<100): continue
+                monitor_end=datetime.fromisoformat(promoted_at)+timedelta(hours=24)
+                if now<monitor_end: continue
+                post=self._experiment_counts(wid,dim,cohort,candidate,promoted_at,monitor_end.isoformat())
+                if post[0]<300 or (wf.get("objective",{}).get("primary")=="engagement_rate" and post[1]<100):
+                    self._record_experiment(eid,"monitoring_inconclusive",ts,{"monitoring_result":"minimum_sample_not_met","dials":post[0],"window_hours":24})
+                    continue
                 current_kpis=self._arm_rates(wf,post)
-                primary=wf.get("objective",{}).get("primary"); old=baseline.get("candidate_kpis",{})
-                delta=current_kpis.get(primary,0)-old.get(primary,0)
-                details={"post_promotion":current_kpis,"promotion_baseline":old,"primary_delta":delta,"dials":post[0]}
-                if delta<-0.02:
+                details,regressed=self._promotion_monitor(wf,baseline,post,promoted_at,monitor_end.isoformat())
+                details.update({"post_promotion":current_kpis,"dials":post[0],"monitor_window_hours":24})
+                if regressed:
+                    primary=wf.get("objective",{}).get("primary")
                     cfg=json.loads(json.dumps(current["config"]))
                     cfg.setdefault("allocations",{}).setdefault(cohort,{})[dim]={control:1.0}
                     exp={"experiment_id":eid,"workflow_id":wid,"dimension":dim,"cohort_id":cohort,"control":control,"candidate":candidate}
@@ -639,13 +653,17 @@ class Controller:
                         summary=f"Roll back degraded {dim} {candidate} to {control}.",dry_run=details,impact_score=0.7,
                         affected_leads=int(wf.get("daily_batch",{}).get("size",0)))
                     self._record_experiment(eid,"rollback_pending",ts,{"proposal_id":pid,"verification":details})
+                else:
+                    self._record_experiment(eid,"monitoring_passed",ts,{"monitoring_result":"no_material_degradation","verification":details,"window_hours":24})
                 continue
             if status!="active": continue
             elapsed=(now-datetime.fromisoformat(started)).total_seconds()/3600
             if elapsed<48: continue
             candidate_metrics=self._experiment_counts(wid,dim,cohort,candidate,started,ts)
             control_metrics=self._experiment_counts(wid,dim,cohort,control,started,ts)
-            comparison=self._compare_experiment(wf,candidate_metrics,control_metrics)
+            options=wf.get("options",{})
+            multiplicity=sum(max(0,len(options.get(d,[]))-1) for d in ("voice","welcome_message"))
+            comparison=self._compare_experiment(wf,candidate_metrics,control_metrics,multiplicity)
             if not comparison.get("minimum_sample"):
                 decision={"result":"inconclusive_minimum_sample","candidate":candidate_metrics,"control":control_metrics}
                 self._finish_experiment_to_control(eid,wf,current,control,candidate,dim,cohort,ts,decision)
@@ -665,7 +683,7 @@ class Controller:
                 decision={"result":"not_promoted","comparison":comparison}
                 self._finish_experiment_to_control(eid,wf,current,control,candidate,dim,cohort,ts,decision)
         for wid,wf in by_id.items():
-            active=self.store.db.execute("SELECT 1 FROM experiments WHERE workflow_id=? AND status IN ('awaiting_start','active','promotion_pending','rollback_pending','promoted','confounded') LIMIT 1",(wid,)).fetchone()
+            active=self.store.db.execute("SELECT 1 FROM experiments WHERE workflow_id=? AND status IN ('awaiting_start','active','promotion_pending','rollback_pending','promoted','confounded','abort_pending') LIMIT 1",(wid,)).fetchone()
             if not active:
                 current=self.get_json(f"/workflows/{wid}/config")
                 self._new_experiment(wf,current,ts)
@@ -675,7 +693,36 @@ class Controller:
         return {"pickup_rate":connected/dials if dials else 0,
                 "engagement_rate":engaged/connected if connected else 0}
 
-    def _compare_experiment(self,wf,candidate,control):
+    def _promotion_monitor(self,wf,baseline,post,start,end):
+        """Take one fixed 24h post-promotion look; compare primary and guardrail separately."""
+        objective=wf.get("objective",{}); primary=objective.get("primary")
+        base=baseline.get("candidate",(0,0,0)); bd,bc,be=base
+        pd,pc,pe=post
+        def pair(metric,counts):
+            d,c,e=counts
+            return (d,c) if metric=="pickup_rate" else (c,e)
+        bn,bx=pair(primary,base); pn,px=pair(primary,post)
+        primary_delta,primary_se=self._rate_delta(bn,bx,pn,px)
+        guard=objective.get("guardrail",{}); guard_name=next(iter(guard),None)
+        guard_metric=guard_name.replace("_max_drop","") if guard_name else None
+        if guard_metric:
+            gbn,gbx=pair(guard_metric,base); gpn,gpx=pair(guard_metric,post)
+            guard_delta,guard_se=self._rate_delta(gbn,gbx,gpn,gpx)
+            guard_lower=guard_delta-1.96*guard_se
+            guard_failed=guard_lower < -float(guard[guard_name])
+        else:
+            guard_delta=0.0; guard_lower=0.0; guard_failed=False
+        primary_upper=primary_delta+1.96*primary_se
+        primary_failed=primary_upper < -0.02
+        details={"monitor_start":start,"monitor_end":end,"primary":primary,
+            "primary_delta":primary_delta,"primary_upper_95":primary_upper,
+            "primary_degradation_threshold":-0.02,"guardrail":guard_name,
+            "guardrail_delta":guard_delta,"guardrail_lower_95":guard_lower,
+            "guardrail_limit":float(guard.get(guard_name,0)) if guard_name else None,
+            "primary_regression":primary_failed,"guardrail_regression":guard_failed}
+        return details,primary_failed or guard_failed
+
+    def _compare_experiment(self,wf,candidate,control,multiplicity=1):
         cd,cc,ce=candidate; bd,bc,be=control
         objective=wf.get("objective",{}); primary=objective.get("primary")
         if primary=="pickup_rate": p_n,p_x,b_n,b_x=cd,cc,bd,bc
@@ -689,13 +736,16 @@ class Controller:
         else: gn=gx=bgn=bgx=0
         gd,gse=self._rate_delta(bgn,bgx,gn,gx) if gn and bgn else (0,float("inf"))
         limit=float(guard.get(guard_name,0)) if guard_name else 0
-        # One fixed look after 48h; 2.58 is a one-sided 0.5% tail threshold.
-        minimum=cd>=300 and bd>=300 and (primary!="engagement_rate" or min(cc,bc)>=100)
+        # One fixed look after 48h. Bonferroni controls planned variant comparisons.
+        primary_threshold=NormalDist().inv_cdf(1-0.005/max(1,int(multiplicity)))
+        needs_connected=primary=="engagement_rate" or guard_metric=="engagement_rate"
+        minimum=cd>=300 and bd>=300 and (not needs_connected or min(cc,bc)>=100)
         guardrail_passes=(not guard_name) or (gd-1.96*gse>=-limit)
         return {"minimum_sample":minimum,"candidate_dials":cd,"control_dials":bd,
                 "candidate_connected":cc,"control_connected":bc,"candidate_engaged":ce,"control_engaged":be,
                 "primary":primary,"primary_delta":primary_delta,"primary_z":primary_z,
-                "primary_wins":minimum and primary_delta>=0.02 and primary_z>=2.58,
+                "primary_threshold":primary_threshold,
+                "primary_wins":minimum and primary_delta>=0.02 and primary_z>=primary_threshold,
                 "guardrail":guard_name,"guardrail_delta":gd,"guardrail_limit":limit,"guardrail_passes":guardrail_passes,
                 "candidate_kpis":self._arm_rates(wf,candidate),"control_kpis":self._arm_rates(wf,control)}
 
@@ -847,9 +897,31 @@ class Controller:
 
     def verify_prompt_changes(self,workflows,ts):
         by_id={w.get("workflow_id",w.get("id")):w for w in workflows}
-        rows=self.store.db.execute("SELECT incident_id,workflow_id,details,status FROM incidents WHERE kind='supervisor_prompt_change' AND status IN ('approval_pending','verify')").fetchall()
+        rows=self.store.db.execute("SELECT incident_id,workflow_id,details,status FROM incidents WHERE kind='supervisor_prompt_change' AND status IN ('approval_pending','verify','rollback_pending')").fetchall()
         for iid,wid,raw,status in rows:
             details=json.loads(raw); wf=by_id.get(wid,{})
+            if status=="rollback_pending":
+                rollback=self.store.db.execute("SELECT status,body FROM proposals WHERE proposal_id=?",(details.get("rollback_proposal_id"),)).fetchone()
+                if not rollback: continue
+                rstatus,rbody=rollback
+                if rstatus=="applied":
+                    current=self.get_json(f"/workflows/{wid}/config")
+                    expected=json.loads(rbody).get("proposed_config",{}).get("prompt_version")
+                    observed=current.get("config",{}).get("prompt_version")
+                    new_status="rolled_back" if str(observed)==str(expected)==str(details.get("safe_prompt")) else "rollback_config_mismatch"
+                elif rstatus in ("rejected","expired","lapsed","stale","denied","deferred_fatigue","apply_error"):
+                    new_status="rollback_"+("failed" if rstatus=="apply_error" else rstatus)
+                else:
+                    continue
+                details["rollback_status"]=rstatus
+                details["rollback_observed_prompt"]=observed if rstatus=="applied" else None
+                with self.store.db:
+                    self.store.db.execute("UPDATE incidents SET status=?,details=?,updated_at=? WHERE incident_id=?",
+                        (new_status,json.dumps(details,sort_keys=True),ts,iid))
+                self.store.audit(ts,wid,"prompt_incident_"+new_status,{"incident_id":iid,
+                    "rollback_proposal_id":details.get("rollback_proposal_id"),"proposal_status":rstatus,
+                    "observed_prompt":details.get("rollback_observed_prompt")})
+                continue
             proposal=self.store.db.execute("SELECT status,updated_at FROM proposals WHERE proposal_id=?",(details.get("proposal_id"),)).fetchone()
             if not proposal: continue
             pstatus,updated=proposal
@@ -987,6 +1059,7 @@ class Controller:
                 details={"caller_id":str(worst[0]),"pre_window_hours":24,"pre_dials":int(worst[1]),
                     "pre_pickup":rates[worst[0]],"comparison_dials":int(other_n),
                     "comparison_pickup":other_success/other_n,"pre_engagement":before_engagement,"proposal_id":proposal_id,
+                    "pre_population_pickup":before_pickup,"pre_population_engagement":before_engagement,
                     "before_allocation":before_dist,"after_allocation":cfg["allocations"]["default"]["caller_id"],
                     "applied_at":ts,"post_dials":0,"post_connected":0}
                 with self.store.db:
@@ -1011,12 +1084,12 @@ class Controller:
             guard_name=next(iter(guard),None)
             guard_limit=float(guard.get(guard_name,0)) if guard_name else 0
             guard_metric=guard_name.replace('_max_drop','') if guard_name else None
-            pre_primary=details.get('pre_pickup',0) if primary=='pickup_rate' else details.get('pre_engagement',0)
+            pre_primary=details.get('pre_population_pickup',details.get('pre_pickup',0)) if primary=='pickup_rate' else details.get('pre_population_engagement',details.get('pre_engagement',0))
             observed_primary=pickup if primary=='pickup_rate' else engagement
             guard_value=pickup if guard_metric=='pickup_rate' else engagement
             details.update({"post_dials":dials,"post_connected":connected,"post_engaged":engaged,
                 "post_pickup":pickup,"post_engagement":engagement,"verified_at":ts})
-            guard_baseline=details.get("pre_pickup",0) if guard_metric=="pickup_rate" else details.get("pre_engagement",0)
+            guard_baseline=details.get("pre_population_pickup",details.get("pre_pickup",0)) if guard_metric=="pickup_rate" else details.get("pre_population_engagement",details.get("pre_engagement",0))
             if observed_primary < pre_primary-0.02 or (guard_metric and guard_value < guard_baseline-guard_limit):
                 details["verification_result"]="degraded"
                 wf_config=self.get_json(f"/workflows/{wid}/config")
@@ -1037,6 +1110,55 @@ class Controller:
                 self.store.db.execute("UPDATE incidents SET status=?,details=?,updated_at=? WHERE incident_id=?",
                     (status,json.dumps(details,sort_keys=True),ts,iid))
             self.store.audit(ts,wid,"caller_id_incident_"+details["verification_result"],details)
+
+    def reconcile_caller_id_incidents(self, ts: str) -> None:
+        """Advance incident status from the durable rollback proposal lifecycle."""
+        rows=self.store.db.execute("SELECT incident_id,workflow_id,details FROM incidents WHERE kind='caller_id_degradation' AND status='rollback_pending'").fetchall()
+        for iid,wid,raw in rows:
+            details=json.loads(raw); pid=details.get("rollback_proposal_id")
+            proposal=self.store.db.execute("SELECT status,body FROM proposals WHERE proposal_id=?",(pid,)).fetchone() if pid else None
+            if not proposal: continue
+            pstatus,body=proposal
+            if pstatus in ("rejected","expired","lapsed","stale","denied","deferred_fatigue","apply_error"):
+                status="rollback_"+("failed" if pstatus=="apply_error" else pstatus)
+            elif pstatus=="applied":
+                try:
+                    current=self.get_json(f"/workflows/{wid}/config")
+                    expected=json.loads(body).get("proposed_config")
+                except (RuntimeError,httpx.HTTPError,ValueError,KeyError) as exc:
+                    self.store.audit(ts,wid,"caller_id_rollback_config_check_failed",{"incident_id":iid,"proposal_id":pid,"error":str(exc)})
+                    continue
+                status="rolled_back" if current.get("config")==expected else "rollback_config_mismatch"
+                self.store.audit(ts,wid,"caller_id_incident_rollback_applied" if status=="rolled_back" else "caller_id_rollback_config_mismatch",
+                    {"incident_id":iid,"proposal_id":pid,"expected_config":expected,"observed_config":current.get("config")})
+            else:
+                continue
+            details["rollback_status"]=pstatus
+            with self.store.db:
+                self.store.db.execute("UPDATE incidents SET status=?,details=?,updated_at=? WHERE incident_id=?",
+                    (status,json.dumps(details,sort_keys=True),ts,iid))
+            self.store.audit(ts,wid,"caller_id_incident_"+status,{"incident_id":iid,"proposal_id":pid,"proposal_status":pstatus})
+
+    def audit_open_experiments_at_horizon(self, ts: str) -> None:
+        rows=self.store.db.execute("SELECT experiment_id,workflow_id,dimension,cohort_id,control,candidate,status,started_at,decision FROM experiments WHERE status IN ('awaiting_start','active','promotion_pending','rollback_pending','promoted','confounded','abort_pending')").fetchall()
+        final=datetime.fromisoformat(ts)
+        for eid,wid,dim,cohort,control,candidate,status,started,raw_decision in rows:
+            decision=json.loads(raw_decision) if raw_decision else {}
+            horizon_start=decision.get("promoted_at",started) if status=="promoted" else started
+            age=max(0,(final-datetime.fromisoformat(horizon_start)).total_seconds()/3600)
+            if status=="active":
+                candidate_stats=self._experiment_counts(wid,dim,cohort,candidate,started,ts)
+                control_stats=self._experiment_counts(wid,dim,cohort,control,started,ts)
+                reason="fixed_48h_horizon_not_elapsed" if age<48 else "evaluation_not_completed_before_simulator_end"
+            else:
+                candidate_stats=self._experiment_counts(wid,dim,cohort,candidate,horizon_start,ts)
+                control_stats=self._experiment_counts(wid,dim,cohort,control,horizon_start,ts)
+                reason=("post_promotion_24h_monitoring_horizon_not_elapsed" if status=="promoted"
+                    else "proposal_or_abort_lifecycle_pending_at_simulator_end")
+            self.store.audit(ts,wid,"experiment_open_at_horizon",{"experiment_id":eid,"dimension":dim,
+                "cohort_id":cohort,"control":control,"candidate":candidate,"status":status,
+                "elapsed_hours":age,"reason":reason,"candidate_exposure":candidate_stats,
+                "control_exposure":control_stats,"decision":"no promotion or rejection; retain observed status"})
 
     def loop(self) -> None:
         wall_start=time.monotonic()
@@ -1087,6 +1209,7 @@ class Controller:
             self.verify_prompt_changes(workflows,ts)
             self.detect_caller_id_incidents(workflows, ts)
             self.verify_caller_id_incidents(workflows, ts)
+            self.reconcile_caller_id_incidents(ts)
             self.run_experiments(workflows,ts)
             # Record separate population KPIs for each observed workflow, never combine them.
             for wf in workflows:
@@ -1107,6 +1230,7 @@ class Controller:
         total_wall=time.monotonic()-wall_start
         try: simulated_days=max(0,(datetime.fromisoformat(final_ts)-datetime.fromisoformat(sim_start)).total_seconds()/86400)
         except ValueError: simulated_days=0
+        self.audit_open_experiments_at_horizon(final_ts)
         metrics=self.store.storage_metrics()
         self.store.audit(final_ts, None, "controller_finished", {"last_chunk": self.store.cursor(),"wall_seconds":total_wall,
             "simulated_days":simulated_days,"wall_seconds_per_simulated_day":total_wall/simulated_days if simulated_days else None,
