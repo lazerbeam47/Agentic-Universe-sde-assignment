@@ -173,9 +173,9 @@ def _rollback_fixture(path, monkeypatch, auto=True, fail_first=False):
         "objective":{"primary":"engagement_rate","guardrail":{"pickup_rate_max_drop":0.02}},
         "governance":{"max_requests_per_24h":4,"auto_apply":{"enabled":auto,
             "allowed_dims":["caller_id"] if auto else [],"max_shift":0.2}}}
-    before={"allocations":{"default":{"caller_id":{"D1":0.8,"D2":0.2}}}}
-    after={"allocations":{"default":{"caller_id":{"D1":1.0}}}}
-    live={"version":5,"config":after}
+    before={"allocations":{"default":{"caller_id":{"D1":0.5,"D2":0.5}}}}
+    after={"allocations":{"default":{"caller_id":{"D1":0.7,"D2":0.3}}}}
+    live={"version":5,"config":before}
     ctl=Controller("http://unused",store)
     def get_json(path,**kwargs):
         if path=="/workflows/wf/config": return json.loads(json.dumps(live))
@@ -186,7 +186,7 @@ def _rollback_fixture(path, monkeypatch, auto=True, fail_first=False):
     def request(method,path,**kwargs):
         if method=="PUT" and path=="/workflows/wf/config":
             attempts["put"]+=1
-            if fail_first and attempts["put"]==1: raise RuntimeError("simulated connection loss")
+            if fail_first and attempts["put"]==2: raise RuntimeError("simulated connection loss")
             payload=kwargs["json"]
             live["config"]=payload["proposed_config"]; live["version"]+=1
             return _Response({"version":live["version"],"config":live["config"]})
@@ -196,15 +196,24 @@ def _rollback_fixture(path, monkeypatch, auto=True, fail_first=False):
     monkeypatch.setattr(ctl,"get_json",get_json)
     monkeypatch.setattr(ctl,"request",request)
     start="2027-01-04T10:00:00+05:30"
-    details={"caller_id":"D2","pre_pickup":0.30,"pre_engagement":0.60,
-        "pre_population_pickup":0.50,"pre_population_engagement":0.60,
-        "before_allocation":{"D1":0.8,"D2":0.2},"after_allocation":{"D1":1.0},"applied_at":start}
-    with store.db:
-        store.db.execute("INSERT INTO incidents VALUES(?,?,?,?,?,?,?)",
-            ("caller-id:wf:D2","wf","caller_id_degradation","verify",start,json.dumps(details),start))
-    calls=[{"event_id":i+1,"type":"call","workflow_id":"wf","ts":f"2027-01-04T{11+i//100:02d}:00:00+05:30",
-        "variant":{"caller_id":"D1"},"connected":i%5<2,"engaged":i%20==0} for i in range(300)]
-    store.save_chunk(1,"\n".join(map(json.dumps,calls)))
+    baseline=[]
+    for i in range(2000):
+        j=i%1000; cid="D1" if i<1000 else "D2"
+        connected=j<(500 if cid=="D1" else 100)
+        engaged=j<(300 if cid=="D1" else 60)
+        baseline.append({"event_id":i+1,"type":"call","workflow_id":"wf","ts":"2027-01-04T09:00:00+05:30",
+            "variant":{"caller_id":cid},"connected":connected,"engaged":engaged})
+    store.save_chunk(1,"\n".join(map(json.dumps,baseline)))
+    ctl.detect_caller_id_incidents([wf],start)
+    assert live["config"]==after
+    post=[]
+    for i in range(300):
+        cid="D1" if i<210 else "D2"; j=i if cid=="D1" else i-210
+        connected=j<(100 if cid=="D1" else 10)
+        engaged=connected and j<(18 if cid=="D1" else 2)
+        post.append({"event_id":2001+i,"type":"call","workflow_id":"wf","ts":"2027-01-04T11:00:00+05:30",
+            "variant":{"caller_id":cid},"connected":connected,"engaged":engaged})
+    store.save_chunk(2,"\n".join(map(json.dumps,post)))
     return store,ctl,wf,live,before,after,attempts
 
 
@@ -228,9 +237,9 @@ def test_caller_rollback_is_applied_verified_and_idempotent_after_restart(tmp_pa
     reopened=Store(str(tmp_path/"rollback.sqlite3")); ctl2=Controller("http://unused",reopened)
     monkeypatch.setattr(ctl2,"get_json",ctl.get_json)
     ctl2.reconcile_caller_id_incidents(ts)
-    assert reopened.db.execute("SELECT COUNT(*) FROM proposals").fetchone()[0]==1
+    assert reopened.db.execute("SELECT COUNT(*) FROM proposals").fetchone()[0]==2
     assert reopened.db.execute("SELECT status FROM incidents WHERE incident_id='caller-id:wf:D2'").fetchone()[0]=="rolled_back"
-    assert attempts["put"]==1
+    assert attempts["put"]==2
 
 
 def test_caller_rollback_retries_uncertain_apply_after_restart(tmp_path,monkeypatch):
@@ -248,12 +257,13 @@ def test_caller_rollback_retries_uncertain_apply_after_restart(tmp_path,monkeypa
     assert live["config"]==before
     assert reopened.db.execute("SELECT status FROM proposals WHERE proposal_id=?",(proposal_id,)).fetchone()[0]=="applied"
     assert reopened.db.execute("SELECT status FROM incidents WHERE incident_id='caller-id:wf:D2'").fetchone()[0]=="rolled_back"
-    assert attempts["put"]==2
+    assert attempts["put"]==3
 
 
 def test_caller_rollback_obeys_approval_rejection_and_stale_version(tmp_path,monkeypatch):
-    store,ctl,wf,live,before,after,_=_rollback_fixture(tmp_path/"approval.sqlite3",monkeypatch,auto=False)
+    store,ctl,wf,live,before,after,_=_rollback_fixture(tmp_path/"approval.sqlite3",monkeypatch)
     ts="2027-01-04T15:00:00+05:30"
+    wf["governance"]["auto_apply"]["allowed_dims"]=[]
     ctl.verify_caller_id_incidents([wf],ts)
     details=json.loads(store.db.execute("SELECT details FROM incidents WHERE incident_id='caller-id:wf:D2'").fetchone()[0])
     pid=details["rollback_proposal_id"]

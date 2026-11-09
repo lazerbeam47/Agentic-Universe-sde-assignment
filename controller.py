@@ -1013,7 +1013,7 @@ class Controller:
             if not caller_gap_is_significant(worst[1],worst[2] or 0,other_n,other_success): continue
             incident_id=f"caller-id:{wid}:{worst[0]}"
             existing=self.store.db.execute("SELECT status FROM incidents WHERE incident_id=?",(incident_id,)).fetchone()
-            if existing and existing[0] in ("proposal_pending","verify","verified"): continue
+            if existing and existing[0] in ("proposal_pending","verify","verified","rollback_pending","rolled_back"): continue
             current=self.get_json(f"/workflows/{wid}/config"); cfg=json.loads(json.dumps(current["config"]))
             allocations=cfg.get("allocations",{})
             if any("caller_id" in values for group,values in allocations.items() if group!="default"): continue
@@ -1056,15 +1056,20 @@ class Controller:
                 impact_score=min(1,max(0,(other_success/other_n-rates[worst[0]])*2)),
                 affected_leads=int(wf.get("daily_batch",{}).get("size",0)))
             if proposal_id:
+                proposal=self.store.db.execute("SELECT status,updated_at FROM proposals WHERE proposal_id=?",(proposal_id,)).fetchone()
+                pstatus,pupdated=proposal if proposal else ("missing",ts)
                 details={"caller_id":str(worst[0]),"pre_window_hours":24,"pre_dials":int(worst[1]),
                     "pre_pickup":rates[worst[0]],"comparison_dials":int(other_n),
                     "comparison_pickup":other_success/other_n,"pre_engagement":before_engagement,"proposal_id":proposal_id,
                     "pre_population_pickup":before_pickup,"pre_population_engagement":before_engagement,
                     "before_allocation":before_dist,"after_allocation":cfg["allocations"]["default"]["caller_id"],
-                    "applied_at":ts,"post_dials":0,"post_connected":0}
+                    "detected_at":ts,"applied_at":pupdated if pstatus=="applied" else None,"post_dials":0,"post_connected":0}
+                if pstatus=="applied": incident_status="verify"
+                elif pstatus in ("prepared","pending","approved","uncertain"): incident_status="proposal_pending"
+                else: incident_status="proposal_"+pstatus
                 with self.store.db:
                     self.store.db.execute("INSERT INTO incidents VALUES(?,?,?,?,?,?,?) ON CONFLICT(incident_id) DO UPDATE SET status=excluded.status,details=excluded.details,updated_at=excluded.updated_at",
-                      (incident_id,wid,"caller_id_degradation","verify",ts,json.dumps(details,sort_keys=True),ts))
+                      (incident_id,wid,"caller_id_degradation",incident_status,ts,json.dumps(details,sort_keys=True),ts))
                 self.store.audit(ts,wid,"caller_id_incident_detected",details)
 
     def verify_caller_id_incidents(self, workflows: list[dict], ts: str) -> None:
@@ -1112,7 +1117,24 @@ class Controller:
             self.store.audit(ts,wid,"caller_id_incident_"+details["verification_result"],details)
 
     def reconcile_caller_id_incidents(self, ts: str) -> None:
-        """Advance incident status from the durable rollback proposal lifecycle."""
+        """Advance caller incidents from durable initial and rollback proposal states."""
+        initial=self.store.db.execute("SELECT incident_id,workflow_id,details FROM incidents WHERE kind='caller_id_degradation' AND status='proposal_pending'").fetchall()
+        for iid,wid,raw in initial:
+            details=json.loads(raw); proposal=self.store.db.execute("SELECT status,updated_at FROM proposals WHERE proposal_id=?",(details.get("proposal_id"),)).fetchone()
+            if not proposal: continue
+            pstatus,pupdated=proposal
+            if pstatus=="applied":
+                details["applied_at"]=pupdated
+                status="verify"
+            elif pstatus in ("rejected","expired","lapsed","stale","denied","deferred_fatigue","apply_error"):
+                status="proposal_"+("failed" if pstatus=="apply_error" else pstatus)
+            else:
+                continue
+            with self.store.db:
+                self.store.db.execute("UPDATE incidents SET status=?,details=?,updated_at=? WHERE incident_id=?",
+                    (status,json.dumps(details,sort_keys=True),ts,iid))
+            self.store.audit(ts,wid,"caller_id_initial_change_"+status,{"incident_id":iid,
+                "proposal_id":details.get("proposal_id"),"proposal_status":pstatus})
         rows=self.store.db.execute("SELECT incident_id,workflow_id,details FROM incidents WHERE kind='caller_id_degradation' AND status='rollback_pending'").fetchall()
         for iid,wid,raw in rows:
             details=json.loads(raw); pid=details.get("rollback_proposal_id")
