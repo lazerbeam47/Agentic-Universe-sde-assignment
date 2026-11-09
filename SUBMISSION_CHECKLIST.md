@@ -15,12 +15,13 @@
 ## Publishing status
 
 - [x] The user supplied the personal destination: `https://github.com/lazerbeam47/Agentic-Universe-sde-assignment.git`.
-- [x] A read-only `git ls-remote` check succeeded and returned no refs, so the destination had no branch history before publishing.
-- [ ] Push the completed `main` history and verify remote `main` matches local `HEAD`.
+- [x] The destination was empty before publishing; the completed local history was pushed without force.
+- [x] Remote `main` was verified against local `HEAD` after pushing the package commit.
+- [x] The original assignment repository remains configured as `upstream`; the personal repository is `origin`.
 - [ ] Share the repository with the address specified on the application form. The form and its address are not present in this workspace.
 - [ ] Submit the repository link through the form or channel specified there.
 
-The original assignment repository is configured as `origin` at present. It must be preserved as `upstream`; never push to it. Configure the supplied empty personal repository as `origin`, then push:
+The following setup commands were used for the empty personal destination; they are recorded for reference and should not be rerun in this already-configured checkout:
 
 ```bash
 git remote rename origin upstream
@@ -29,7 +30,7 @@ git push -u origin main
 git ls-remote origin refs/heads/main
 ```
 
-Compare the `ls-remote` hash with `git rev-parse HEAD` after pushing. Do not force-push.
+No force-push was used.
 
 ## Optional video
 
